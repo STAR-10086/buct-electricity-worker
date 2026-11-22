@@ -208,7 +208,7 @@ export function renderAdminHtml(adminEmail: string): string {
         </div>
         <div style="flex: 1; min-width: 220px;">
           <label>房间 ID (roomid)</label>
-          <input type="text" id="testRoomId" value="CCPS.BUCT.B0601.F03.R0324" style="margin-bottom: 0;" />
+          <input type="text" id="testRoomId" value="CCPS.BUCT.B0601.F01.R0102" style="margin-bottom: 0;" />
         </div>
         <button class="secondary" onclick="testQuery()">测试查询</button>
       </div>
