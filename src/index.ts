@@ -1,5 +1,22 @@
 import { renderAdminHtml } from "./adminHtml";
-import { lookupRoom, ROOMS_JSON_STRING, RoomMeta, TOTAL_ROOMS } from "./rooms";
+import {
+  authenticateAdminHeaders,
+  corsHeaders,
+  createUpstreamGateway,
+  ElectricityPayload,
+  FACTORY_CODE,
+  maskHex32,
+  MissBucket,
+  normalizeSessionCredentials,
+  nowSeconds,
+  parsePositiveInt,
+  SessionState,
+  UpstreamAuthExpiredError,
+  UpstreamBusyError,
+  UpstreamQueryError,
+  verifyClientSignatureHeaders,
+} from "./core";
+import { lookupRoom, ROOMS_JSON_STRING, TOTAL_ROOMS } from "./rooms";
 
 export interface Env {
   ELE_KV: KVNamespace;
@@ -12,90 +29,12 @@ export interface Env {
   DISABLE_ZERO_TRUST_CHECK?: string;
 }
 
-interface SessionState {
-  openid: string;
-  jsessionid: string;
-  alive: boolean;
-  updatedAt: number;
-  lastHeartbeatAt: number;
-  lastCheckedAt: number;
-  lastError: string;
-}
-
-interface ElectricityPayload {
-  schoolid: string;
-  roomid: string;
-  campusName: string;
-  buildingName: string;
-  floorName: string;
-  roomName: string;
-  meterType: string;
-  balanceText: string;
-  balanceValue: number | null;
-  unit: string;
-  accountStatus: string;
-  queriedAt: number;
-  fromCache: boolean;
-}
-
-interface MissBucket {
-  count: number;
-  resetAt: number;
-}
-
-class UpstreamBusyError extends Error {}
-class UpstreamAuthExpiredError extends Error {}
-class UpstreamQueryError extends Error {
-  constructor(
-    public readonly statusCode: number,
-    message: string
-  ) {
-    super(message);
-  }
-}
-
 const KV_SESSION_KEY = "session_state";
-const MCARD_BASE = "https://mcard.buct.edu.cn";
-const FACTORY_CODE = "E005";
-const INVALID_OPENID = "DCFDE1134D316C1242D25B6EAB6B41A3";
-const WX_USER_AGENT =
-  "Mozilla/5.0 (Linux; Android 14; wv) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Version/4.0 Chrome/138.0.7204.180 Mobile Safari/537.36 " +
-  "wxwork/5.0.13 MicroMessenger/7.0.1";
 
-const MAX_UPSTREAM_CONCURRENCY = 5;
-const SIGNATURE_MAX_SKEW_SECONDS = 300;
-const HEX_32_RE = /^[0-9A-F]{32}$/;
-const CLIENT_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
-
-let inFlightUpstream = 0;
+const upstream = createUpstreamGateway();
 const isolateMissMap = new Map<string, MissBucket>();
-const inFlightRoomQueries = new Map<string, Promise<ElectricityPayload>>();
 let isolateLastCheckedAt = 0;
 let isolateLastHeartbeatAt = 0;
-
-function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
-}
-
-function nowSeconds(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function maskHex32(val: string): string {
-  const clean = (val || "").trim();
-  if (clean.length < 12) return clean ? "***" : "";
-  return `${clean.slice(0, 6)}...${clean.slice(-4)}`;
-}
-
-function corsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Client-Id, X-Timestamp, X-Sign",
-  };
-}
 
 function jsonResponse(
   body: unknown,
@@ -113,140 +52,6 @@ function jsonResponse(
   });
 }
 
-function parseJwtEmail(jwtToken: string): { email: string; expired: boolean } {
-  try {
-    const parts = jwtToken.split(".");
-    if (parts.length !== 3) return { email: "", expired: false };
-    const normalized = parts[1].replaceAll("-", "+").replaceAll("_", "/");
-    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-    const payload = JSON.parse(atob(padded)) as { email?: string; exp?: number };
-    const expired = typeof payload.exp === "number" && payload.exp < nowSeconds();
-    return {
-      email: typeof payload.email === "string" ? payload.email.trim() : "",
-      expired,
-    };
-  } catch {
-    return { email: "", expired: false };
-  }
-}
-
-function authenticateAdmin(
-  request: Request,
-  env: Env
-): { ok: true; email: string } | { ok: false; status: number; error: string } {
-  if (env.DISABLE_ZERO_TRUST_CHECK === "true") {
-    return { ok: true, email: "local-dev@localhost" };
-  }
-
-  const jwt = (request.headers.get("Cf-Access-Jwt-Assertion") || "").trim();
-  if (!jwt) {
-    return {
-      ok: false,
-      status: 403,
-      error: "拒绝访问：未检测到 Cloudflare Zero Trust Access 认证凭据",
-    };
-  }
-
-  const parsed = parseJwtEmail(jwt);
-  if (parsed.expired) {
-    return {
-      ok: false,
-      status: 401,
-      error: "Zero Trust 会话已过期，请刷新页面重新登录",
-    };
-  }
-
-  const headerEmail = (request.headers.get("Cf-Access-Authenticated-User-Email") || "").trim();
-  const effectiveEmail = headerEmail || parsed.email;
-
-  const allowedRaw = (env.ALLOWED_ADMIN_EMAIL || "").trim();
-  if (allowedRaw) {
-    const allowedSet = new Set(
-      allowedRaw
-        .split(",")
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean)
-    );
-    if (!effectiveEmail || !allowedSet.has(effectiveEmail.toLowerCase())) {
-      return {
-        ok: false,
-        status: 403,
-        error: "拒绝访问：当前账号不在管理员邮箱白名单中",
-      };
-    }
-  }
-
-  return { ok: true, email: effectiveEmail || "Zero Trust 用户" };
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function timingSafeEqualStr(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-async function verifyClientSignature(
-  request: Request,
-  roomid: string,
-  env: Env
-): Promise<{ ok: true; clientId: string } | { ok: false; status: number; error: string }> {
-  const requireSig = (env.REQUIRE_APP_SIGNATURE || "false").toLowerCase() === "true";
-  const rawClientId = (request.headers.get("X-Client-Id") || "").trim();
-
-  if (rawClientId && !CLIENT_ID_RE.test(rawClientId)) {
-    return {
-      ok: false,
-      status: 400,
-      error: "请求头 X-Client-Id 格式无效（仅允许 4~64 位字母数字及 _-）",
-    };
-  }
-
-  if (!requireSig) {
-    return { ok: true, clientId: rawClientId || "anonymous" };
-  }
-
-  const secret = (env.APP_SIGN_SECRET || "").trim();
-  if (!secret) {
-    return {
-      ok: false,
-      status: 500,
-      error: "服务端未配置 APP_SIGN_SECRET",
-    };
-  }
-
-  if (!rawClientId) {
-    return { ok: false, status: 401, error: "缺少请求头 X-Client-Id" };
-  }
-
-  const tsRaw = (request.headers.get("X-Timestamp") || "").trim();
-  const signRaw = (request.headers.get("X-Sign") || "").trim().toLowerCase();
-  const ts = Number(tsRaw);
-  if (!Number.isInteger(ts) || Math.abs(nowSeconds() - ts) > SIGNATURE_MAX_SKEW_SECONDS) {
-    return { ok: false, status: 401, error: "请求时间戳无效或已过期" };
-  }
-  if (!/^[0-9a-f]{64}$/.test(signRaw)) {
-    return { ok: false, status: 401, error: "请求签名格式无效" };
-  }
-
-  const expected = await sha256Hex(`${rawClientId}:${roomid}:${ts}:${secret}`);
-  if (!timingSafeEqualStr(expected, signRaw)) {
-    return { ok: false, status: 401, error: "请求签名校验失败" };
-  }
-
-  return { ok: true, clientId: rawClientId };
-}
-
 async function readSessionState(env: Env): Promise<SessionState | null> {
   const raw = await env.ELE_KV.get<SessionState>(KV_SESSION_KEY, "json");
   if (!raw || !raw.openid || !raw.jsessionid) {
@@ -257,67 +62,6 @@ async function readSessionState(env: Env): Promise<SessionState | null> {
 
 async function writeSessionState(env: Env, state: SessionState): Promise<void> {
   await env.ELE_KV.put(KV_SESSION_KEY, JSON.stringify(state));
-}
-
-async function withUpstreamSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (inFlightUpstream >= MAX_UPSTREAM_CONCURRENCY) {
-    throw new UpstreamBusyError("上游查询并发已满，请稍后重试");
-  }
-  inFlightUpstream++;
-  try {
-    return await fn();
-  } finally {
-    inFlightUpstream--;
-  }
-}
-
-interface McardResponse {
-  success?: boolean;
-  message?: string;
-  resultData?: Record<string, unknown>;
-}
-
-async function callMcard(
-  path: string,
-  payload: Record<string, unknown>,
-  openid: string,
-  jsessionid: string
-): Promise<{ noauth: boolean; status: number; data: McardResponse | null }> {
-  const cleanSid = jsessionid.replace(/^JSESSIONID=/i, "").trim();
-  const targetUrl = `${MCARD_BASE}${path}?openid=${encodeURIComponent(openid.trim())}&connect_redirect=1`;
-
-  return withUpstreamSlot(async () => {
-    const resp = await fetch(targetUrl, {
-      method: "POST",
-      redirect: "manual",
-      headers: {
-        "Content-Type": "application/json",
-        Cookie: `JSESSIONID=${cleanSid}`,
-        "User-Agent": WX_USER_AGENT,
-        "X-Requested-With": "XMLHttpRequest",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const noauthHeader = (resp.headers.get("Noauthentication") || "").toLowerCase() === "true";
-    let parsed: McardResponse | null = null;
-    try {
-      parsed = (await resp.json()) as McardResponse;
-    } catch {
-      parsed = null;
-    }
-
-    const msg = parsed?.message || "";
-    const noauthBody =
-      parsed?.success === false &&
-      (msg.includes("openid无效") || msg.includes("请使用微信客户端"));
-
-    return {
-      noauth: noauthHeader || noauthBody || resp.status === 302,
-      status: resp.status,
-      data: parsed,
-    };
-  });
 }
 
 async function runHeartbeatCheck(
@@ -333,7 +77,7 @@ async function runHeartbeatCheck(
   isolateLastCheckedAt = now;
 
   try {
-    const res = await callMcard(
+    const res = await upstream.callMcard(
       "/channel/getXiaoQuList",
       { factorycode: FACTORY_CODE },
       state.openid,
@@ -386,7 +130,6 @@ async function checkAndConsumeMissQuota(
 ): Promise<{ allowed: boolean; remaining: number; retryAfterSeconds: number }> {
   const now = nowSeconds();
 
-  // Opportunistic cleanup for in-isolate map
   if (isolateMissMap.size > 1000) {
     for (const [k, v] of isolateMissMap) {
       if (v.resetAt <= now) isolateMissMap.delete(k);
@@ -418,7 +161,7 @@ async function checkAndConsumeMissQuota(
       }
     }
   } catch {
-    // Cache read failure gracefully falls back to in-isolate counter
+    // Edge Cache read failure falls back to in-isolate counter
   }
 
   if (activeCount >= limit) {
@@ -451,89 +194,6 @@ async function checkAndConsumeMissQuota(
   };
 }
 
-function parseBalanceValue(balanceText: string): { value: number | null; unit: string } {
-  const numMatch = balanceText.match(/[-+]?\d+(?:\.\d+)?/);
-  const value = numMatch ? Number(numMatch[0]) : null;
-  let unit = "";
-  if (balanceText.includes("元")) unit = "元";
-  else if (/kWh/i.test(balanceText)) unit = "kWh";
-  return {
-    value: value !== null && Number.isFinite(value) ? value : null,
-    unit,
-  };
-}
-
-async function fetchUpstreamElectricity(
-  roomMeta: RoomMeta,
-  env: Env,
-  state: SessionState
-): Promise<ElectricityPayload> {
-  const inflightKey = `${roomMeta.schoolid}\u0000${roomMeta.roomid}`;
-  const existing = inFlightRoomQueries.get(inflightKey);
-  if (existing) {
-    return existing;
-  }
-
-  const task = (async () => {
-    const res = await callMcard(
-      "/channel/queryResEle",
-      {
-        schoolid: roomMeta.schoolid,
-        roomid: roomMeta.roomid,
-        factorycode: FACTORY_CODE,
-      },
-      state.openid,
-      state.jsessionid
-    );
-
-    if (res.noauth) {
-      if (state.alive) {
-        await writeSessionState(env, {
-          ...state,
-          alive: false,
-          lastCheckedAt: nowSeconds(),
-          lastError: res.data?.message || "上游会话已过期",
-        });
-      }
-      throw new UpstreamAuthExpiredError("上游认证会话已过期，等待管理员刷新");
-    }
-
-    if (!res.data?.success) {
-      throw new UpstreamQueryError(
-        502,
-        res.data?.message || "电表不在线或上游查询失败"
-      );
-    }
-
-    const rd = res.data.resultData || {};
-    const balanceText = String(rd.elebalance || "").trim();
-    const parsed = parseBalanceValue(balanceText);
-
-    return {
-      schoolid: roomMeta.schoolid,
-      roomid: roomMeta.roomid,
-      campusName: roomMeta.campusName,
-      buildingName: roomMeta.buildingName,
-      floorName: roomMeta.floorName,
-      roomName: roomMeta.roomName,
-      meterType: roomMeta.meterType,
-      balanceText,
-      balanceValue: parsed.value,
-      unit: parsed.unit,
-      accountStatus: rd.AccountStatus != null ? String(rd.AccountStatus) : "",
-      queriedAt: nowSeconds(),
-      fromCache: false,
-    };
-  })();
-
-  inFlightRoomQueries.set(inflightKey, task);
-  try {
-    return await task;
-  } finally {
-    inFlightRoomQueries.delete(inflightKey);
-  }
-}
-
 async function handlePublicElectricity(
   request: Request,
   url: URL,
@@ -551,7 +211,14 @@ async function handlePublicElectricity(
     return jsonResponse({ error: "非法的校区或房间 ID" }, 400);
   }
 
-  const sigCheck = await verifyClientSignature(request, roomid, env);
+  const sigCheck = await verifyClientSignatureHeaders(
+    (name) => request.headers.get(name) ?? undefined,
+    roomid,
+    {
+      requireSignature: env.REQUIRE_APP_SIGNATURE,
+      appSignSecret: env.APP_SIGN_SECRET,
+    }
+  );
   if (!sigCheck.ok) {
     return jsonResponse({ error: sigCheck.error }, sigCheck.status);
   }
@@ -572,10 +239,7 @@ async function handlePublicElectricity(
 
   const state = await readSessionState(env);
   if (!state || !state.alive) {
-    return jsonResponse(
-      { error: "电费查询网关凭证维护中，请稍后重试" },
-      503
-    );
+    return jsonResponse({ error: "电费查询网关凭证维护中，请稍后重试" }, 503);
   }
 
   const missLimit = parsePositiveInt(env.CLIENT_MISS_LIMIT, 3);
@@ -599,7 +263,15 @@ async function handlePublicElectricity(
   }
 
   try {
-    const payload = await fetchUpstreamElectricity(roomMeta, env, state);
+    const payload = await upstream.fetchElectricity(roomMeta, state, async (errMsg) => {
+      await writeSessionState(env, {
+        ...state,
+        alive: false,
+        lastCheckedAt: nowSeconds(),
+        lastError: errMsg,
+      });
+    });
+
     const cacheTtl = parsePositiveInt(env.CACHE_TTL_SECONDS, 900);
     const cachePutResp = new Response(JSON.stringify(payload), {
       headers: {
@@ -610,10 +282,7 @@ async function handlePublicElectricity(
     ctx.waitUntil(cache.put(cacheReq, cachePutResp));
     return jsonResponse(payload, 200);
   } catch (err) {
-    if (err instanceof UpstreamBusyError) {
-      return jsonResponse({ error: err.message }, 503);
-    }
-    if (err instanceof UpstreamAuthExpiredError) {
+    if (err instanceof UpstreamBusyError || err instanceof UpstreamAuthExpiredError) {
       return jsonResponse({ error: err.message }, 503);
     }
     if (err instanceof UpstreamQueryError) {
@@ -632,25 +301,17 @@ async function handleAdminUpdateSession(request: Request, env: Env): Promise<Res
     return jsonResponse({ error: "请求体必须为合法 JSON" }, 400);
   }
 
-  const openid = (body.openid || "").trim().toUpperCase();
-  const jsessionid = (body.jsessionid || "")
-    .replace(/^JSESSIONID=/i, "")
-    .trim()
-    .toUpperCase();
-
-  if (!HEX_32_RE.test(openid) || openid === INVALID_OPENID) {
-    return jsonResponse({ error: "openid 格式无效（需为 32 位十六进制字符串）" }, 400);
-  }
-  if (!HEX_32_RE.test(jsessionid)) {
-    return jsonResponse({ error: "JSESSIONID 格式无效（需为 32 位十六进制字符串）" }, 400);
+  const normalized = normalizeSessionCredentials(body.openid, body.jsessionid);
+  if (!normalized.ok) {
+    return jsonResponse({ error: normalized.error }, 400);
   }
 
   try {
-    const check = await callMcard(
+    const check = await upstream.callMcard(
       "/channel/getXiaoQuList",
       { factorycode: FACTORY_CODE },
-      openid,
-      jsessionid
+      normalized.openid,
+      normalized.jsessionid
     );
     if (!check.data?.success) {
       return jsonResponse(
@@ -668,8 +329,8 @@ async function handleAdminUpdateSession(request: Request, env: Env): Promise<Res
   isolateLastHeartbeatAt = now;
 
   const nextState: SessionState = {
-    openid,
-    jsessionid,
+    openid: normalized.openid,
+    jsessionid: normalized.jsessionid,
     alive: true,
     updatedAt: now,
     lastHeartbeatAt: now,
@@ -681,8 +342,8 @@ async function handleAdminUpdateSession(request: Request, env: Env): Promise<Res
   return jsonResponse({
     success: true,
     message: "验活通过，新凭证已写入 KV 并激活保活",
-    openidMasked: maskHex32(openid),
-    jsessionidMasked: maskHex32(jsessionid),
+    openidMasked: maskHex32(normalized.openid),
+    jsessionidMasked: maskHex32(normalized.jsessionid),
   });
 }
 
@@ -702,7 +363,14 @@ async function handleAdminTestQuery(url: URL, env: Env): Promise<Response> {
   }
 
   try {
-    const payload = await fetchUpstreamElectricity(roomMeta, env, state);
+    const payload = await upstream.fetchElectricity(roomMeta, state, async (errMsg) => {
+      await writeSessionState(env, {
+        ...state,
+        alive: false,
+        lastCheckedAt: nowSeconds(),
+        lastError: errMsg,
+      });
+    });
     return jsonResponse(payload, 200);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -719,12 +387,10 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Never expose internal cache key paths externally
     if (path.startsWith("/__cache/")) {
       return jsonResponse({ error: "Not Found" }, 404);
     }
 
-    // ---------- Public API routes ----------
     if (request.method === "GET" && path === "/v1/health") {
       const state = await readSessionState(env);
       return jsonResponse({
@@ -751,9 +417,14 @@ export default {
       return handlePublicElectricity(request, url, env, ctx);
     }
 
-    // ---------- Zero Trust protected Admin routes ----------
     if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/")) {
-      const auth = authenticateAdmin(request, env);
+      const auth = authenticateAdminHeaders(
+        (name) => request.headers.get(name) ?? undefined,
+        {
+          disableZeroTrustCheck: env.DISABLE_ZERO_TRUST_CHECK,
+          allowedAdminEmail: env.ALLOWED_ADMIN_EMAIL,
+        }
+      );
       if (!auth.ok) {
         if (path.startsWith("/admin/api/")) {
           return jsonResponse({ error: auth.error }, auth.status);

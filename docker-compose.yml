@@ -1,0 +1,19 @@
+services:
+  buct-electricity:
+    build: .
+    container_name: buct-electricity
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      PORT: "8080"
+      SESSION_FILE: "/data/session_state.json"
+      ALLOWED_ADMIN_EMAIL: "${ALLOWED_ADMIN_EMAIL:-}"
+      REQUIRE_APP_SIGNATURE: "${REQUIRE_APP_SIGNATURE:-false}"
+      APP_SIGN_SECRET: "${APP_SIGN_SECRET:-}"
+      CACHE_TTL_SECONDS: "${CACHE_TTL_SECONDS:-900}"
+      CLIENT_MISS_LIMIT: "${CLIENT_MISS_LIMIT:-3}"
+      CLIENT_MISS_WINDOW_SECONDS: "${CLIENT_MISS_WINDOW_SECONDS:-600}"
+      HEARTBEAT_INTERVAL_SECONDS: "${HEARTBEAT_INTERVAL_SECONDS:-480}"

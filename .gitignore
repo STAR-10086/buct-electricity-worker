@@ -2,6 +2,8 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+.env
+data/
 .DS_Store
 buct_electricity_gateway_guide.md
 buct_electricity_rooms.json
