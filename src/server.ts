@@ -3,7 +3,7 @@ import http, { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
 import { renderAdminHtml } from "./adminHtml";
 import {
-  authenticateAdminHeaders,
+  authenticateAdminRequest,
   corsHeaders,
   createUpstreamGateway,
   ElectricityPayload,
@@ -34,6 +34,9 @@ const HEARTBEAT_INTERVAL_SECONDS = parsePositiveInt(process.env.HEARTBEAT_INTERV
 const REQUIRE_APP_SIGNATURE = process.env.REQUIRE_APP_SIGNATURE || "false";
 const APP_SIGN_SECRET = process.env.APP_SIGN_SECRET || "";
 const ALLOWED_ADMIN_EMAIL = process.env.ALLOWED_ADMIN_EMAIL || "";
+const ALLOWED_ADMIN_HOST = process.env.ALLOWED_ADMIN_HOST || "";
+const CF_ACCESS_TEAM_DOMAIN = process.env.CF_ACCESS_TEAM_DOMAIN || "";
+const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD || "";
 const DISABLE_ZERO_TRUST_CHECK = process.env.DISABLE_ZERO_TRUST_CHECK || "false";
 
 const MAX_ADMIN_BODY_BYTES = 64 * 1024;
@@ -438,10 +441,17 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/")) {
-    const auth = authenticateAdminHeaders(makeHeaderGetter(req), {
-      disableZeroTrustCheck: DISABLE_ZERO_TRUST_CHECK,
-      allowedAdminEmail: ALLOWED_ADMIN_EMAIL,
-    });
+    const auth = await authenticateAdminRequest(
+      makeHeaderGetter(req),
+      req.headers.host || url.host,
+      {
+        allowedAdminHost: ALLOWED_ADMIN_HOST,
+        disableZeroTrustCheck: DISABLE_ZERO_TRUST_CHECK,
+        cfAccessTeamDomain: CF_ACCESS_TEAM_DOMAIN,
+        cfAccessAud: CF_ACCESS_AUD,
+        allowedAdminEmail: ALLOWED_ADMIN_EMAIL,
+      }
+    );
     if (!auth.ok) {
       if (path.startsWith("/admin/api/")) {
         sendJson(res, { error: auth.error }, auth.status);

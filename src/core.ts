@@ -67,6 +67,17 @@ export const SIGNATURE_MAX_SKEW_SECONDS = 300;
 export const HEX_32_RE = /^[0-9A-F]{32}$/;
 export const CLIENT_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
 
+const JWKS_CACHE_TTL_SECONDS = 3600;
+const JWKS_REFRESH_COOLDOWN_SECONDS = 30;
+
+interface CachedJwks {
+  keysByKid: Map<string, CryptoKey>;
+  fetchedAt: number;
+}
+
+const jwksCache = new Map<string, CachedJwks>();
+const inflightJwksFetches = new Map<string, Promise<CachedJwks>>();
+
 export type HeaderGetter = (name: string) => string | undefined;
 
 export function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -92,27 +103,139 @@ export function corsHeaders(): Record<string, string> {
   };
 }
 
-export function parseJwtEmail(jwtToken: string): { email: string; expired: boolean } {
+function base64UrlToBytes(b64url: string): Uint8Array<ArrayBuffer> {
+  const normalized = b64url.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+function normalizeHostname(rawHost: string): string {
+  const trimmed = rawHost.trim().toLowerCase();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("[")) {
+    const endIdx = trimmed.indexOf("]");
+    return endIdx !== -1 ? trimmed.slice(0, endIdx + 1) : trimmed;
+  }
+  return trimmed.split(":")[0].trim();
+}
+
+function normalizeTeamOrigin(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   try {
-    const parts = jwtToken.split(".");
-    if (parts.length !== 3) return { email: "", expired: false };
-    const normalized = parts[1].replaceAll("-", "+").replaceAll("_", "/");
-    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-    const payload = JSON.parse(atob(padded)) as { email?: string; exp?: number };
-    const expired = typeof payload.exp === "number" && payload.exp < nowSeconds();
-    return {
-      email: typeof payload.email === "string" ? payload.email.trim() : "",
-      expired,
-    };
+    const u = new URL(withScheme);
+    if (u.protocol !== "https:") return "";
+    return u.origin.toLowerCase();
   } catch {
-    return { email: "", expired: false };
+    return "";
   }
 }
 
-export function authenticateAdminHeaders(
+async function fetchJwks(teamOrigin: string): Promise<CachedJwks> {
+  const existing = inflightJwksFetches.get(teamOrigin);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const resp = await fetch(`${teamOrigin}/cdn-cgi/access/certs`, {
+        method: "GET",
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      if (!resp.ok) {
+        throw new Error(`拉取 Cloudflare Access 公钥失败 (HTTP ${resp.status})`);
+      }
+      const data = (await resp.json()) as {
+        keys?: Array<{
+          kid?: string;
+          kty?: string;
+          alg?: string;
+          n?: string;
+          e?: string;
+          use?: string;
+        }>;
+      };
+      const keysByKid = new Map<string, CryptoKey>();
+      for (const k of data.keys || []) {
+        if (!k.kid || k.kty !== "RSA" || !k.n || !k.e) continue;
+        if (k.alg && k.alg !== "RS256") continue;
+        const cryptoKey = await crypto.subtle.importKey(
+          "jwk",
+          { kty: k.kty, n: k.n, e: k.e, alg: "RS256", ext: true },
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          false,
+          ["verify"]
+        );
+        keysByKid.set(k.kid, cryptoKey);
+      }
+      if (keysByKid.size === 0) {
+        throw new Error("Cloudflare Access certs 未包含有效 RS256 公钥");
+      }
+      const entry: CachedJwks = { keysByKid, fetchedAt: nowSeconds() };
+      jwksCache.set(teamOrigin, entry);
+      return entry;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+
+  inflightJwksFetches.set(teamOrigin, task);
+  try {
+    return await task;
+  } finally {
+    inflightJwksFetches.delete(teamOrigin);
+  }
+}
+
+async function getVerificationKey(teamOrigin: string, kid: string): Promise<CryptoKey | null> {
+  const now = nowSeconds();
+  let cached = jwksCache.get(teamOrigin);
+  if (!cached || now - cached.fetchedAt > JWKS_CACHE_TTL_SECONDS) {
+    cached = await fetchJwks(teamOrigin);
+  }
+  let key = cached.keysByKid.get(kid);
+  if (!key && now - cached.fetchedAt > JWKS_REFRESH_COOLDOWN_SECONDS) {
+    cached = await fetchJwks(teamOrigin);
+    key = cached.keysByKid.get(kid);
+  }
+  return key ?? null;
+}
+
+export interface AdminAuthConfig {
+  allowedAdminHost?: string;
+  disableZeroTrustCheck?: string;
+  cfAccessTeamDomain?: string;
+  cfAccessAud?: string;
+  allowedAdminEmail?: string;
+}
+
+export async function authenticateAdminRequest(
   getHeader: HeaderGetter,
-  config: { disableZeroTrustCheck?: string; allowedAdminEmail?: string }
-): { ok: true; email: string } | { ok: false; status: number; error: string } {
+  requestHost: string,
+  config: AdminAuthConfig
+): Promise<{ ok: true; email: string } | { ok: false; status: number; error: string }> {
+  const allowedHostsRaw = (config.allowedAdminHost || "").trim();
+  if (allowedHostsRaw) {
+    const reqHost = normalizeHostname(requestHost);
+    const allowedHosts = new Set(
+      allowedHostsRaw
+        .split(",")
+        .map((h) => normalizeHostname(h))
+        .filter(Boolean)
+    );
+    if (!reqHost || !allowedHosts.has(reqHost)) {
+      return { ok: false, status: 404, error: "Not Found" };
+    }
+  }
+
   if (config.disableZeroTrustCheck === "true") {
     return { ok: true, email: "local-dev@localhost" };
   }
@@ -126,18 +249,92 @@ export function authenticateAdminHeaders(
     };
   }
 
-  const parsed = parseJwtEmail(jwt);
-  if (parsed.expired) {
+  const teamOrigin = normalizeTeamOrigin(config.cfAccessTeamDomain || "");
+  if (!teamOrigin) {
     return {
       ok: false,
-      status: 401,
-      error: "Zero Trust 会话已过期，请刷新页面重新登录",
+      status: 500,
+      error: "服务端未配置 CF_ACCESS_TEAM_DOMAIN，拒绝未验签访问",
     };
   }
 
-  const headerEmail = (getHeader("Cf-Access-Authenticated-User-Email") || "").trim();
-  const effectiveEmail = headerEmail || parsed.email;
+  const parts = jwt.split(".");
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 格式无效" };
+  }
 
+  let header: { alg?: string; kid?: string };
+  let payload: {
+    iss?: string;
+    aud?: string | string[];
+    exp?: number;
+    nbf?: number;
+    email?: string;
+  };
+  let sigBytes: Uint8Array<ArrayBuffer>;
+  try {
+    const dec = new TextDecoder();
+    header = JSON.parse(dec.decode(base64UrlToBytes(parts[0]))) as typeof header;
+    payload = JSON.parse(dec.decode(base64UrlToBytes(parts[1]))) as typeof payload;
+    sigBytes = base64UrlToBytes(parts[2]);
+  } catch {
+    return { ok: false, status: 401, error: "Zero Trust JWT 解码失败" };
+  }
+
+  if (header.alg !== "RS256" || typeof header.kid !== "string" || !header.kid) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 算法或 kid 无效" };
+  }
+
+  let verifyKey: CryptoKey | null;
+  try {
+    verifyKey = await getVerificationKey(teamOrigin, header.kid);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, status: 502, error: `Zero Trust 公钥获取失败: ${msg}` };
+  }
+
+  if (!verifyKey) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 签名密钥未匹配" };
+  }
+
+  const signedData = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+  const sigValid = await crypto.subtle.verify(
+    { name: "RSASSA-PKCS1-v1_5" },
+    verifyKey,
+    sigBytes,
+    signedData
+  );
+  if (!sigValid) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 签名验证失败" };
+  }
+
+  const now = nowSeconds();
+  const payloadIss = (payload.iss || "").trim().replace(/\/+$/, "").toLowerCase();
+  if (payloadIss !== teamOrigin) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 签发者 (iss) 不匹配" };
+  }
+
+  if (typeof payload.exp !== "number" || payload.exp <= now) {
+    return { ok: false, status: 401, error: "Zero Trust 会话已过期，请刷新页面重新登录" };
+  }
+
+  if (typeof payload.nbf === "number" && payload.nbf > now + 60) {
+    return { ok: false, status: 401, error: "Zero Trust JWT 尚未生效" };
+  }
+
+  const expectedAud = (config.cfAccessAud || "").trim();
+  if (expectedAud) {
+    const audList = Array.isArray(payload.aud)
+      ? payload.aud
+      : typeof payload.aud === "string"
+        ? [payload.aud]
+        : [];
+    if (!audList.includes(expectedAud)) {
+      return { ok: false, status: 401, error: "Zero Trust JWT 受众 (aud) 不匹配" };
+    }
+  }
+
+  const signedEmail = typeof payload.email === "string" ? payload.email.trim() : "";
   const allowedRaw = (config.allowedAdminEmail || "").trim();
   if (allowedRaw) {
     const allowedSet = new Set(
@@ -146,7 +343,7 @@ export function authenticateAdminHeaders(
         .map((s) => s.trim().toLowerCase())
         .filter(Boolean)
     );
-    if (!effectiveEmail || !allowedSet.has(effectiveEmail.toLowerCase())) {
+    if (!signedEmail || !allowedSet.has(signedEmail.toLowerCase())) {
       return {
         ok: false,
         status: 403,
@@ -155,7 +352,7 @@ export function authenticateAdminHeaders(
     }
   }
 
-  return { ok: true, email: effectiveEmail || "Zero Trust 用户" };
+  return { ok: true, email: signedEmail || "Zero Trust 用户" };
 }
 
 export async function sha256Hex(input: string): Promise<string> {

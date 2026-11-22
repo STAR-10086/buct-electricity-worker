@@ -1,6 +1,6 @@
 import { renderAdminHtml } from "./adminHtml";
 import {
-  authenticateAdminHeaders,
+  authenticateAdminRequest,
   corsHeaders,
   createUpstreamGateway,
   ElectricityPayload,
@@ -26,6 +26,9 @@ export interface Env {
   REQUIRE_APP_SIGNATURE?: string;
   APP_SIGN_SECRET?: string;
   ALLOWED_ADMIN_EMAIL?: string;
+  ALLOWED_ADMIN_HOST?: string;
+  CF_ACCESS_TEAM_DOMAIN?: string;
+  CF_ACCESS_AUD?: string;
   DISABLE_ZERO_TRUST_CHECK?: string;
 }
 
@@ -418,10 +421,14 @@ export default {
     }
 
     if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/")) {
-      const auth = authenticateAdminHeaders(
+      const auth = await authenticateAdminRequest(
         (name) => request.headers.get(name) ?? undefined,
+        url.host,
         {
+          allowedAdminHost: env.ALLOWED_ADMIN_HOST,
           disableZeroTrustCheck: env.DISABLE_ZERO_TRUST_CHECK,
+          cfAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
+          cfAccessAud: env.CF_ACCESS_AUD,
           allowedAdminEmail: env.ALLOWED_ADMIN_EMAIL,
         }
       );

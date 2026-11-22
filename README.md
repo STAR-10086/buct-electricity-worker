@@ -20,7 +20,7 @@
    - 支持可选轻签名校验（`REQUIRE_APP_SIGNATURE = "true"` 时验证 `X-Timestamp` 与 `X-Sign = SHA-256(clientId:roomid:timestamp:APP_SIGN_SECRET)`）。
    - 内置上游并发上限（最多同时 5 个回源请求）与同房间请求合并（singleflight）。
 4. **Zero Trust 管理员控制台（`/admin`）**：
-   - 无硬编码密码或静态 Token，管理员路由受 Cloudflare Zero Trust Access 保护（服务端同时校验 `Cf-Access-Jwt-Assertion` 与可选邮箱白名单 `ALLOWED_ADMIN_EMAIL`）。
+   - 无硬编码密码或静态 Token，管理员路由受 Cloudflare Zero Trust Access 保护：服务端通过 `CF_ACCESS_TEAM_DOMAIN/cdn-cgi/access/certs` 拉取 Cloudflare 官方 JWKS 公钥，使用 `RS256` 严格校验 `Cf-Access-Jwt-Assertion` 数字签名、`iss`、`exp`、可选 `CF_ACCESS_AUD` 及已签名 JWT 内的 `email` 白名单（`ALLOWED_ADMIN_EMAIL`），并支持通过 `ALLOWED_ADMIN_HOST` 将管理台隔离到独立域名（未配置域名命中直接返回 `404`），彻底杜绝在 Cloudflare for SaaS / 多域名场景下伪造 `Cf-Access-*` 请求头绕过鉴权。
    - 内置单页控制台，支持**直接拖入 ProxyPin `.har` 文件在浏览器本地解析最新 `openid` 与 `Set-Cookie: JSESSIONID`**，或**直接手填更新**，提交前自动向学校接口验活。
 
 ---
@@ -33,9 +33,14 @@
 git clone https://github.com/STAR-10086/buct-electricity-worker.git
 cd buct-electricity-worker
 
-# 可选：创建 .env 设置管理员邮箱白名单与签名密钥
+# 创建 .env：务必配置 CF_ACCESS_TEAM_DOMAIN 以开启 Zero Trust RS256 公钥验签
 cat > .env << 'EOF'
+CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
 ALLOWED_ADMIN_EMAIL=your-email@example.com
+# 如使用 SaaS 优选域名对外服务、独立橙色云朵域名进后台，建议绑定管理台域名（不匹配直接 404）
+ALLOWED_ADMIN_HOST=admin.example.com
+# 可选：填 Zero Trust Application 中的 AUD 标签进一步绑定指定应用
+CF_ACCESS_AUD=
 REQUIRE_APP_SIGNATURE=false
 APP_SIGN_SECRET=
 EOF
@@ -70,9 +75,10 @@ curl http://127.0.0.1:8080/v1/health
   1. 在 Cloudflare **DNS → Records** 添加一条 `ele` 指向你 VPS 公网 IP 的 `A` 记录，务必保持 **Proxied（橙色云朵）开启**（否则 `Cf-Access-*` 头与 Zero Trust 不会生效）。
   2. 在 VPS 现有的 Caddy 或 Nginx 中反代 `ele.buct.one` 到 `http://127.0.0.1:8080`。
 
-### 第 4 步：确认 Zero Trust（`ele.buct.one/admin*`）保持不变
+### 第 4 步：确认 Zero Trust 策略与后台域名隔离
 
-- 之前在 **Cloudflare Zero Trust → Access → Applications** 中为 `ele.buct.one`（路径 `admin*`）配置好的 Access 应用**无需任何修改**，流量经过 Cloudflare 边缘节点进入 VPS 之前依然会经过相同的 Zero Trust 登录拦截，并继续透传 `Cf-Access-Jwt-Assertion` 与 `Cf-Access-Authenticated-User-Email` 到容器内的 Node.js 服务端。
+- 在 **Cloudflare Zero Trust → Access → Applications** 中保护管理台域名（路径填 `admin*`）；流量经过 Cloudflare 边缘节点进入 VPS 之前会触发 Zero Trust 登录，VPS 服务端再通过 `CF_ACCESS_TEAM_DOMAIN` 校验 `Cf-Access-Jwt-Assertion` 的 RS256 签名及 `ALLOWED_ADMIN_EMAIL`。
+- 若对外查电费域名使用了 **Cloudflare for SaaS 优选**（CNAME 到未直接绑定 Zero Trust 的域名），强烈建议通过 `ALLOWED_ADMIN_HOST` 仅允许专属橙色云朵管理域名访问 `/admin*`，公开优选域名访问 `/admin*` 将直接返回 `404`。
 - `/v1/*` 不在 Zero Trust 路径范围内，供客户端直接请求。
 
 ### 第 5 步：初始化凭证
