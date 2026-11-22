@@ -1,0 +1,17 @@
+name = "buct-electricity-worker"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+workers_dev = false
+
+[triggers]
+crons = ["*/8 * * * *"]
+
+[[kv_namespaces]]
+binding = "ELE_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[vars]
+CACHE_TTL_SECONDS = "900"
+CLIENT_MISS_LIMIT = "3"
+CLIENT_MISS_WINDOW_SECONDS = "600"
+REQUIRE_APP_SIGNATURE = "false"
