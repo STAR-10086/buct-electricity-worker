@@ -24,12 +24,20 @@ jobs:
       - name: TypeScript check
         run: npm run typecheck
 
-      - name: Skip deploy when GitHub secret is absent
-        if: ${{ secrets.CLOUDFLARE_API_TOKEN == '' }}
-        run: echo "CLOUDFLARE_API_TOKEN secret not set; skipping wrangler deploy (assuming Cloudflare Workers Git integration)."
+      - name: Check Cloudflare deploy secret
+        id: check_cf
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "${CF_API_TOKEN:-}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "CLOUDFLARE_API_TOKEN secret not set; skipping wrangler deploy (assuming Cloudflare Workers Git integration)."
+          fi
 
       - name: Deploy to Cloudflare Workers
-        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        if: steps.check_cf.outputs.configured == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
