@@ -14,10 +14,11 @@
 2. **缓存优先 + 8 分钟自动心跳保活**：
    - 电费查询结果默认缓存 **15 分钟**（`CACHE_TTL_SECONDS = 900`），缓存命中直接返回，不消耗限流配额、不请求学校接口。
    - 内置后台定时任务（`480s` / 8 分钟一次）自动调用 `/channel/getXiaoQuList` 刷新学校 Tomcat `JSESSIONID` 空闲计时器；会话状态持久化到 `/data/session_state.json`。
-3. **适配校园网同出口 IP 的多端精准限流**：
+3. **适配校园网同出口 IP 的多端精准限流与学号防滥用黑名单**：
    - **不做粗暴 IP 封锁**（避免北化校园网共用 NAT 出口 IP 导致全校误伤）。
-   - 改为按设备 `X-Client-Id` 对**未命中缓存的回源查询**限流：默认每 **10 分钟**最多 **3 次**新房间回源查询（已缓存房间可无限次刷新）。
-   - 支持可选轻签名校验（`REQUIRE_APP_SIGNATURE = "true"` 时验证 `X-Timestamp` 与 `X-Sign = SHA-256(clientId:roomid:timestamp:APP_SIGN_SECRET)`）。
+   - 同时按设备 `X-Client-Id` 与学号 `X-Student-Id` 对**未命中缓存的回源查询**限流：默认每 **10 分钟**最多 **3 次**新房间回源查询（已缓存房间可无限次刷新）。
+   - 开启签名鉴权（`REQUIRE_APP_SIGNATURE = "true"`）时强校验 `X-Student-Id`、`X-Client-Id`、`X-Timestamp` 与 `X-Sign = SHA-256(studentId:clientId:roomid:timestamp:APP_SIGN_SECRET)`。
+   - 服务端记录每个学号的总查询次数、回源次数与最近查询房间，并在 `/admin` 管理台提供一键拉黑 / 解封开关（持久化至 `/data/usage_state.json`，拉黑后直接拦截返回 `403`）。
    - 内置上游并发上限（最多同时 5 个回源请求）与同房间请求合并（singleflight）。
 4. **Zero Trust 管理员控制台（`/admin`）**：
    - 无硬编码密码或静态 Token，管理员路由受 Cloudflare Zero Trust Access 保护：服务端通过 `CF_ACCESS_TEAM_DOMAIN/cdn-cgi/access/certs` 拉取 Cloudflare 官方 JWKS 公钥，使用 `RS256` 严格校验 `Cf-Access-Jwt-Assertion` 数字签名、`iss`、`exp`、可选 `CF_ACCESS_AUD` 及已签名 JWT 内的 `email` 白名单（`ALLOWED_ADMIN_EMAIL`），并支持通过 `ALLOWED_ADMIN_HOST` 将管理台隔离到独立域名（未配置域名命中直接返回 `404`），彻底杜绝在 Cloudflare for SaaS / 多域名场景下伪造 `Cf-Access-*` 请求头绕过鉴权。
@@ -96,18 +97,23 @@ curl http://127.0.0.1:8080/v1/health
 - `GET /v1/health`：查看网关是否存活及基础元信息（不含任何个人凭据）。
 - `GET /v1/rooms`：获取全校校区、楼栋、楼层与房间 `roomid` 字典（带 24 小时浏览器/边缘缓存）。
 - `GET /v1/electricity?schoolid=<校区ID>&roomid=<房间ID>`：查询指定房间当前电费余额/剩余度数。
-  - 推荐请求头：`X-Client-Id: <客户端随机生成的 UUIDv4>`
-  - 若开启签名模式（`REQUIRE_APP_SIGNATURE = "true"`），还需附带：
+  - 推荐请求头：
+    - `X-Client-Id: <客户端随机生成的 UUIDv4>`
+    - `X-Student-Id: <当前登录用户学号（经 App 弹窗同意共享）>`
+  - 若开启签名模式（`REQUIRE_APP_SIGNATURE = "true"`），上述两头与下面两头均为**必填**：
     - `X-Timestamp: <当前秒级 Unix 时间戳>`
-    - `X-Sign: <小写十六进制 SHA-256(clientId + ":" + roomid + ":" + timestamp + ":" + APP_SIGN_SECRET)>`
+    - `X-Sign: <小写十六进制 SHA-256(studentId + ":" + clientId + ":" + roomid + ":" + timestamp + ":" + APP_SIGN_SECRET)>`
 
 ### 管理员接口（仅通过 Cloudflare Zero Trust 后可访问）
 
-- `GET /admin`：管理员单页控制台（HAR 解析、凭证更新、状态监控、测试查询）。
+- `GET /admin`：管理员单页控制台（HAR 解析、凭证更新、状态监控、测试查询、学号查询统计与拉黑管理）。
 - `GET /admin/api/status`：查看当前 `openid` / `JSESSIONID` 脱敏状态与最近心跳时间。
 - `POST /admin/api/session`：提交 `{ "openid": "<32位HEX>", "jsessionid": "<32位HEX>" }`，验活成功后持久化。
 - `POST /admin/api/heartbeat`：手动立即执行一次心跳验活。
 - `GET /admin/api/test-query?schoolid=...&roomid=...`：管理员在线测试电费查询（不计入客户端限流）。
+- `GET /admin/api/users?q=`：查询学号维度的查询次数统计与黑名单列表。
+- `POST /admin/api/ban`：提交 `{ "studentId": "...", "reason": "..." }` 拉黑指定学号。
+- `POST /admin/api/unban`：提交 `{ "studentId": "..." }` 解除指定学号拉黑。
 
 ---
 

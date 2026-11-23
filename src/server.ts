@@ -4,7 +4,10 @@ import { dirname } from "node:path";
 import { renderAdminHtml } from "./adminHtml";
 import {
   authenticateAdminRequest,
+  buildBanErrorMessage,
+  checkBannedStudent,
   corsHeaders,
+  createEmptyUsageState,
   createUpstreamGateway,
   ElectricityPayload,
   FACTORY_CODE,
@@ -12,12 +15,17 @@ import {
   maskHex32,
   MissBucket,
   normalizeSessionCredentials,
+  normalizeUsageState,
   nowSeconds,
   parsePositiveInt,
+  recordStudentQuery,
   SessionState,
+  STUDENT_ID_RE,
+  summarizeUsageState,
   UpstreamAuthExpiredError,
   UpstreamBusyError,
   UpstreamQueryError,
+  UsageState,
   verifyClientSignatureHeaders,
 } from "./core";
 import { lookupRoom, ROOMS_JSON_STRING, TOTAL_ROOMS } from "./rooms";
@@ -25,6 +33,7 @@ import { lookupRoom, ROOMS_JSON_STRING, TOTAL_ROOMS } from "./rooms";
 const PORT = parsePositiveInt(process.env.PORT, 8080);
 const HOST = process.env.HOST || "0.0.0.0";
 const SESSION_FILE = process.env.SESSION_FILE || "/data/session_state.json";
+const USAGE_FILE = process.env.USAGE_FILE || "/data/usage_state.json";
 
 const CACHE_TTL_SECONDS = parsePositiveInt(process.env.CACHE_TTL_SECONDS, 900);
 const CLIENT_MISS_LIMIT = parsePositiveInt(process.env.CLIENT_MISS_LIMIT, 3);
@@ -32,6 +41,7 @@ const CLIENT_MISS_WINDOW_SECONDS = parsePositiveInt(process.env.CLIENT_MISS_WIND
 const HEARTBEAT_INTERVAL_SECONDS = parsePositiveInt(process.env.HEARTBEAT_INTERVAL_SECONDS, 480);
 
 const REQUIRE_APP_SIGNATURE = process.env.REQUIRE_APP_SIGNATURE || "false";
+const REQUIRE_STUDENT_ID = process.env.REQUIRE_STUDENT_ID || "false";
 const APP_SIGN_SECRET = process.env.APP_SIGN_SECRET || "";
 const ALLOWED_ADMIN_EMAIL = process.env.ALLOWED_ADMIN_EMAIL || "";
 const ALLOWED_ADMIN_HOST = process.env.ALLOWED_ADMIN_HOST || "";
@@ -46,6 +56,9 @@ const eleCache = new Map<string, { payload: ElectricityPayload; expiresAt: numbe
 const clientMissMap = new Map<string, MissBucket>();
 
 let sessionState: SessionState | null = null;
+let usageState: UsageState = createEmptyUsageState();
+let usageSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let usageDirty = false;
 let memLastCheckedAt = 0;
 let memLastHeartbeatAt = 0;
 
@@ -71,6 +84,46 @@ function saveSessionToDisk(next: SessionState): void {
   const tmpFile = `${SESSION_FILE}.tmp`;
   writeFileSync(tmpFile, JSON.stringify(next, null, 2), "utf8");
   renameSync(tmpFile, SESSION_FILE);
+}
+
+function loadUsageFromDisk(): void {
+  try {
+    mkdirSync(dirname(USAGE_FILE), { recursive: true });
+    if (!existsSync(USAGE_FILE)) return;
+    const raw = JSON.parse(readFileSync(USAGE_FILE, "utf8")) as unknown;
+    usageState = normalizeUsageState(raw);
+    console.log(
+      `[Init] Loaded usage state from ${USAGE_FILE} (users=${Object.keys(usageState.users).length}, banned=${Object.keys(usageState.banned).length})`
+    );
+  } catch (err) {
+    console.error(`[Init] Failed to read ${USAGE_FILE}:`, err);
+  }
+}
+
+function saveUsageImmediate(): void {
+  if (usageSaveTimer) {
+    clearTimeout(usageSaveTimer);
+    usageSaveTimer = null;
+  }
+  usageDirty = false;
+  mkdirSync(dirname(USAGE_FILE), { recursive: true });
+  const tmpFile = `${USAGE_FILE}.tmp`;
+  writeFileSync(tmpFile, JSON.stringify(usageState, null, 2), "utf8");
+  renameSync(tmpFile, USAGE_FILE);
+}
+
+function scheduleUsageSave(): void {
+  usageDirty = true;
+  if (usageSaveTimer) return;
+  usageSaveTimer = setTimeout(() => {
+    usageSaveTimer = null;
+    if (!usageDirty) return;
+    try {
+      saveUsageImmediate();
+    } catch (err) {
+      console.error(`[Usage] Failed to save ${USAGE_FILE}:`, err);
+    }
+  }, 5000);
 }
 
 function makeHeaderGetter(req: IncomingMessage): HeaderGetter {
@@ -134,31 +187,40 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   });
 }
 
-function checkAndConsumeMissQuota(clientId: string): {
+function checkAndConsumeMissQuota(
+  clientId: string,
+  studentId: string
+): {
   allowed: boolean;
   retryAfterSeconds: number;
 } {
   const now = nowSeconds();
-  if (clientMissMap.size > 2000) {
+  if (clientMissMap.size > 4000) {
     for (const [k, v] of clientMissMap) {
       if (v.resetAt <= now) clientMissMap.delete(k);
     }
   }
 
-  const existing = clientMissMap.get(clientId);
-  if (!existing || existing.resetAt <= now) {
-    clientMissMap.set(clientId, { count: 1, resetAt: now + CLIENT_MISS_WINDOW_SECONDS });
-    return { allowed: true, retryAfterSeconds: 0 };
+  const keys = studentId ? [`client:${clientId}`, `student:${studentId}`] : [`client:${clientId}`];
+
+  for (const key of keys) {
+    const existing = clientMissMap.get(key);
+    if (existing && existing.resetAt > now && existing.count >= CLIENT_MISS_LIMIT) {
+      return {
+        allowed: false,
+        retryAfterSeconds: Math.max(1, existing.resetAt - now),
+      };
+    }
   }
 
-  if (existing.count >= CLIENT_MISS_LIMIT) {
-    return {
-      allowed: false,
-      retryAfterSeconds: Math.max(1, existing.resetAt - now),
-    };
+  for (const key of keys) {
+    const existing = clientMissMap.get(key);
+    if (!existing || existing.resetAt <= now) {
+      clientMissMap.set(key, { count: 1, resetAt: now + CLIENT_MISS_WINDOW_SECONDS });
+    } else {
+      existing.count += 1;
+    }
   }
-
-  existing.count += 1;
   return { allowed: true, retryAfterSeconds: 0 };
 }
 
@@ -234,10 +296,17 @@ async function handlePublicElectricity(
 
   const sigCheck = await verifyClientSignatureHeaders(makeHeaderGetter(req), roomid, {
     requireSignature: REQUIRE_APP_SIGNATURE,
+    requireStudentId: REQUIRE_STUDENT_ID,
     appSignSecret: APP_SIGN_SECRET,
   });
   if (!sigCheck.ok) {
     sendJson(res, { error: sigCheck.error }, sigCheck.status);
+    return;
+  }
+
+  const ban = checkBannedStudent(usageState, sigCheck.studentId);
+  if (ban) {
+    sendJson(res, { error: buildBanErrorMessage(ban), banned: true }, 403);
     return;
   }
 
@@ -251,6 +320,9 @@ async function handlePublicElectricity(
   const cacheKey = `${schoolid}\u0000${roomid}`;
   const cached = eleCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
+    if (recordStudentQuery(usageState, sigCheck.studentId, roomMeta, false)) {
+      scheduleUsageSave();
+    }
     sendJson(res, { ...cached.payload, fromCache: true }, 200);
     return;
   }
@@ -261,12 +333,12 @@ async function handlePublicElectricity(
     return;
   }
 
-  const quota = checkAndConsumeMissQuota(sigCheck.clientId);
+  const quota = checkAndConsumeMissQuota(sigCheck.clientId, sigCheck.studentId);
   if (!quota.allowed) {
     sendJson(
       res,
       {
-        error: `该设备未命中缓存的查询过于频繁（每 ${Math.ceil(CLIENT_MISS_WINDOW_SECONDS / 60)} 分钟最多 ${CLIENT_MISS_LIMIT} 次新房间查询），请稍后再试`,
+        error: `未命中缓存的新房间查询过于频繁（每 ${Math.ceil(CLIENT_MISS_WINDOW_SECONDS / 60)} 分钟最多 ${CLIENT_MISS_LIMIT} 次），请稍后再试`,
         retryAfterSeconds: quota.retryAfterSeconds,
       },
       429,
@@ -289,6 +361,9 @@ async function handlePublicElectricity(
       payload,
       expiresAt: nowSeconds() + CACHE_TTL_SECONDS,
     });
+    if (recordStudentQuery(usageState, sigCheck.studentId, roomMeta, true)) {
+      scheduleUsageSave();
+    }
     sendJson(res, payload, 200);
   } catch (err) {
     if (err instanceof UpstreamBusyError || err instanceof UpstreamAuthExpiredError) {
@@ -501,6 +576,57 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<
       return;
     }
 
+    if (method === "GET" && path === "/admin/api/users") {
+      const q = url.searchParams.get("q") || "";
+      sendJson(res, summarizeUsageState(usageState, q));
+      return;
+    }
+
+    if (method === "POST" && path === "/admin/api/ban") {
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "请求体解析失败";
+        sendJson(res, { error: msg }, 400);
+        return;
+      }
+      const sid = typeof body.studentId === "string" ? body.studentId.trim() : "";
+      const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 120) : "";
+      if (!STUDENT_ID_RE.test(sid)) {
+        sendJson(res, { error: "学号格式无效（仅允许 6~20 位字母或数字）" }, 400);
+        return;
+      }
+      usageState.banned[sid] = {
+        studentId: sid,
+        reason: reason || "异常高频查询",
+        bannedAt: nowSeconds(),
+      };
+      saveUsageImmediate();
+      sendJson(res, { success: true, message: `已拉黑学号 ${sid}`, studentId: sid });
+      return;
+    }
+
+    if (method === "POST" && path === "/admin/api/unban") {
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "请求体解析失败";
+        sendJson(res, { error: msg }, 400);
+        return;
+      }
+      const sid = typeof body.studentId === "string" ? body.studentId.trim() : "";
+      if (!STUDENT_ID_RE.test(sid)) {
+        sendJson(res, { error: "学号格式无效" }, 400);
+        return;
+      }
+      delete usageState.banned[sid];
+      saveUsageImmediate();
+      sendJson(res, { success: true, message: `已解除拉黑 ${sid}`, studentId: sid });
+      return;
+    }
+
     sendJson(res, { error: "Not Found" }, 404);
     return;
   }
@@ -509,6 +635,7 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<
 }
 
 loadSessionFromDisk();
+loadUsageFromDisk();
 
 const server = http.createServer((req, res) => {
   routeRequest(req, res).catch((err) => {
@@ -548,6 +675,13 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     console.log(`[Server] Received ${sig}, shutting down...`);
     clearInterval(heartbeatTimer);
+    if (usageDirty) {
+      try {
+        saveUsageImmediate();
+      } catch (err) {
+        console.error("[Usage] Failed to flush on shutdown:", err);
+      }
+    }
     server.close(() => process.exit(0));
   });
 }

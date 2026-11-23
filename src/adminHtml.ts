@@ -98,6 +98,19 @@ export function renderAdminHtml(adminEmail: string): string {
     }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     button.secondary { background: #24324d; color: var(--text); }
+    button.danger { background: rgba(239, 68, 68, 0.22); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); }
+    button.ok-btn { background: rgba(34, 197, 94, 0.2); color: #86efac; border: 1px solid rgba(34, 197, 94, 0.4); }
+    button.sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+    .table-wrap { overflow-x: auto; margin-top: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }
     .dropzone {
       border: 2px dashed var(--border);
       border-radius: 12px;
@@ -213,6 +226,49 @@ export function renderAdminHtml(adminEmail: string): string {
         <button class="secondary" onclick="testQuery()">测试查询</button>
       </div>
       <pre id="testOutput" style="display:none;"></pre>
+    </div>
+
+    <div class="card">
+      <div class="header-row" style="align-items: center; margin-bottom: 10px;">
+        <h2 style="margin: 0;">4. 学号查询统计与滥用拉黑管理</h2>
+        <div class="row">
+          <input type="text" id="userSearchInput" placeholder="搜索学号 / 房间" style="width: 170px; margin-bottom: 0; padding: 7px 10px;" oninput="fetchUsers()" />
+          <button class="secondary" onclick="fetchUsers()">刷新列表</button>
+        </div>
+      </div>
+      <div id="usersSummary" class="sub" style="margin-bottom: 10px;">加载用户统计中...</div>
+
+      <div class="row" style="align-items: flex-end; margin-bottom: 8px;">
+        <div style="width: 170px;">
+          <label>手动拉黑学号</label>
+          <input type="text" id="banStudentInput" placeholder="例如 2024xxxxxx" style="margin-bottom: 0;" />
+        </div>
+        <div style="flex: 1; min-width: 180px;">
+          <label>拉黑原因（展示给该用户）</label>
+          <input type="text" id="banReasonInput" placeholder="异常高频查询不同宿舍" style="margin-bottom: 0;" />
+        </div>
+        <button class="danger" onclick="manualBan()">拉黑学号</button>
+      </div>
+
+      <pre id="userActionLog" style="display:none;"></pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>学号</th>
+              <th>总查 / 回源</th>
+              <th>查过房间数</th>
+              <th>最近查询房间</th>
+              <th>最近活跃</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="usersTbody">
+            <tr><td colspan="7" class="sub">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -466,7 +522,129 @@ export function renderAdminHtml(adminEmail: string): string {
       }
     }
 
+    async function fetchUsers() {
+      var q = encodeURIComponent(document.getElementById("userSearchInput").value.trim());
+      var summary = document.getElementById("usersSummary");
+      var tbody = document.getElementById("usersTbody");
+      try {
+        var data = await apiFetch("/admin/api/users?q=" + q);
+        summary.textContent =
+          "累计活跃学号: " + (data.totalUsers || 0) +
+          " 人  |  当前已拉黑: " + (data.totalBanned || 0) + " 人（按回源次数降序排列）";
+
+        tbody.innerHTML = "";
+        var list = data.users || [];
+        if (list.length === 0) {
+          var emptyTr = document.createElement("tr");
+          var emptyTd = document.createElement("td");
+          emptyTd.colSpan = 7;
+          emptyTd.className = "sub";
+          emptyTd.textContent = "暂无匹配记录";
+          emptyTr.appendChild(emptyTd);
+          tbody.appendChild(emptyTr);
+          return;
+        }
+
+        for (var i = 0; i < list.length; i++) {
+          var u = list[i];
+          var tr = document.createElement("tr");
+
+          var tdId = document.createElement("td");
+          tdId.className = "mono";
+          tdId.textContent = u.studentId;
+          tr.appendChild(tdId);
+
+          var tdCnt = document.createElement("td");
+          tdCnt.className = "mono";
+          tdCnt.textContent = String(u.totalQueries) + " / " + String(u.cacheMissQueries);
+          tr.appendChild(tdCnt);
+
+          var tdRooms = document.createElement("td");
+          tdRooms.className = "mono";
+          tdRooms.textContent = String(u.distinctRoomCount || 0);
+          tr.appendChild(tdRooms);
+
+          var tdLastRoom = document.createElement("td");
+          tdLastRoom.textContent = u.lastRoomLabel || "-";
+          tr.appendChild(tdLastRoom);
+
+          var tdTime = document.createElement("td");
+          tdTime.className = "sub";
+          tdTime.textContent = fmtTime(u.lastSeenAt);
+          tr.appendChild(tdTime);
+
+          var tdStatus = document.createElement("td");
+          var stBadge = document.createElement("span");
+          stBadge.className = "badge " + (u.isBanned ? "err" : "ok");
+          stBadge.textContent = u.isBanned ? ("已拉黑" + (u.banReason ? ": " + u.banReason : "")) : "正常";
+          tdStatus.appendChild(stBadge);
+          tr.appendChild(tdStatus);
+
+          var tdAct = document.createElement("td");
+          var btn = document.createElement("button");
+          btn.className = "sm " + (u.isBanned ? "ok-btn" : "danger");
+          btn.textContent = u.isBanned ? "解封" : "拉黑";
+          (function (studentId, isBanned) {
+            btn.onclick = function () {
+              if (isBanned) {
+                unbanStudent(studentId);
+              } else {
+                var reason = window.prompt("拉黑学号 " + studentId + " 的原因：", "异常高频查询不同宿舍");
+                if (reason !== null) banStudent(studentId, reason);
+              }
+            };
+          })(u.studentId, u.isBanned);
+          tdAct.appendChild(btn);
+          tr.appendChild(tdAct);
+
+          tbody.appendChild(tr);
+        }
+      } catch (err) {
+        summary.textContent = "加载用户统计失败: " + err.message;
+      }
+    }
+
+    async function banStudent(studentId, reason) {
+      try {
+        var res = await apiFetch("/admin/api/ban", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ studentId: studentId, reason: reason || "" })
+        });
+        showPre("userActionLog", res.message || "已拉黑");
+        await fetchUsers();
+      } catch (err) {
+        showPre("userActionLog", "拉黑失败: " + err.message);
+      }
+    }
+
+    async function unbanStudent(studentId) {
+      try {
+        var res = await apiFetch("/admin/api/unban", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ studentId: studentId })
+        });
+        showPre("userActionLog", res.message || "已解封");
+        await fetchUsers();
+      } catch (err) {
+        showPre("userActionLog", "解封失败: " + err.message);
+      }
+    }
+
+    async function manualBan() {
+      var sid = document.getElementById("banStudentInput").value.trim();
+      var reason = document.getElementById("banReasonInput").value.trim();
+      if (!sid) {
+        showPre("userActionLog", "请输入要拉黑的学号");
+        return;
+      }
+      await banStudent(sid, reason);
+      document.getElementById("banStudentInput").value = "";
+    }
+
     fetchStatus();
+    fetchUsers();
   </script>
 </body>
 </html>`;

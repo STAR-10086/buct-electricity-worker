@@ -31,6 +31,28 @@ export interface MissBucket {
   resetAt: number;
 }
 
+export interface StudentUsageRecord {
+  studentId: string;
+  totalQueries: number;
+  cacheMissQueries: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  lastRoomId: string;
+  lastRoomLabel: string;
+  recentRooms: string[];
+}
+
+export interface BanRecord {
+  studentId: string;
+  reason: string;
+  bannedAt: number;
+}
+
+export interface UsageState {
+  users: Record<string, StudentUsageRecord>;
+  banned: Record<string, BanRecord>;
+}
+
 export interface McardResponse {
   success?: boolean;
   message?: string;
@@ -66,6 +88,7 @@ export const MAX_UPSTREAM_CONCURRENCY = 5;
 export const SIGNATURE_MAX_SKEW_SECONDS = 300;
 export const HEX_32_RE = /^[0-9A-F]{32}$/;
 export const CLIENT_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
+export const STUDENT_ID_RE = /^[A-Za-z0-9]{6,20}$/;
 
 const JWKS_CACHE_TTL_SECONDS = 3600;
 const JWKS_REFRESH_COOLDOWN_SECONDS = 30;
@@ -99,7 +122,7 @@ export function corsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Client-Id, X-Timestamp, X-Sign",
+    "Access-Control-Allow-Headers": "Content-Type, X-Client-Id, X-Student-Id, X-Timestamp, X-Sign",
   };
 }
 
@@ -375,10 +398,16 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
 export async function verifyClientSignatureHeaders(
   getHeader: HeaderGetter,
   roomid: string,
-  config: { requireSignature?: string; appSignSecret?: string }
-): Promise<{ ok: true; clientId: string } | { ok: false; status: number; error: string }> {
+  config: { requireSignature?: string; requireStudentId?: string; appSignSecret?: string }
+): Promise<
+  | { ok: true; clientId: string; studentId: string }
+  | { ok: false; status: number; error: string }
+> {
   const requireSig = (config.requireSignature || "false").toLowerCase() === "true";
+  const requireStudentId =
+    requireSig || (config.requireStudentId || "false").toLowerCase() === "true";
   const rawClientId = (getHeader("X-Client-Id") || "").trim();
+  const rawStudentId = (getHeader("X-Student-Id") || "").trim();
 
   if (rawClientId && !CLIENT_ID_RE.test(rawClientId)) {
     return {
@@ -388,8 +417,19 @@ export async function verifyClientSignatureHeaders(
     };
   }
 
+  if (rawStudentId && !STUDENT_ID_RE.test(rawStudentId)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "请求头 X-Student-Id 格式无效（仅允许 6~20 位字母或数字）",
+    };
+  }
+
   if (!requireSig) {
-    return { ok: true, clientId: rawClientId || "anonymous" };
+    if (requireStudentId && !rawStudentId) {
+      return { ok: false, status: 401, error: "缺少请求头 X-Student-Id" };
+    }
+    return { ok: true, clientId: rawClientId || "anonymous", studentId: rawStudentId };
   }
 
   const secret = (config.appSignSecret || "").trim();
@@ -401,6 +441,9 @@ export async function verifyClientSignatureHeaders(
     };
   }
 
+  if (!rawStudentId) {
+    return { ok: false, status: 401, error: "缺少请求头 X-Student-Id" };
+  }
   if (!rawClientId) {
     return { ok: false, status: 401, error: "缺少请求头 X-Client-Id" };
   }
@@ -415,12 +458,158 @@ export async function verifyClientSignatureHeaders(
     return { ok: false, status: 401, error: "请求签名格式无效" };
   }
 
-  const expected = await sha256Hex(`${rawClientId}:${roomid}:${ts}:${secret}`);
+  const expected = await sha256Hex(`${rawStudentId}:${rawClientId}:${roomid}:${ts}:${secret}`);
   if (!timingSafeEqualStr(expected, signRaw)) {
     return { ok: false, status: 401, error: "请求签名校验失败" };
   }
 
-  return { ok: true, clientId: rawClientId };
+  return { ok: true, clientId: rawClientId, studentId: rawStudentId };
+}
+
+export function createEmptyUsageState(): UsageState {
+  return { users: {}, banned: {} };
+}
+
+export function normalizeUsageState(raw: unknown): UsageState {
+  if (!raw || typeof raw !== "object") return createEmptyUsageState();
+  const obj = raw as { users?: unknown; banned?: unknown };
+  const users: Record<string, StudentUsageRecord> = {};
+  const banned: Record<string, BanRecord> = {};
+
+  if (obj.users && typeof obj.users === "object") {
+    for (const [k, v] of Object.entries(obj.users as Record<string, unknown>)) {
+      if (!STUDENT_ID_RE.test(k) || !v || typeof v !== "object") continue;
+      const rec = v as Partial<StudentUsageRecord>;
+      users[k] = {
+        studentId: k,
+        totalQueries: typeof rec.totalQueries === "number" ? rec.totalQueries : 0,
+        cacheMissQueries: typeof rec.cacheMissQueries === "number" ? rec.cacheMissQueries : 0,
+        firstSeenAt: typeof rec.firstSeenAt === "number" ? rec.firstSeenAt : 0,
+        lastSeenAt: typeof rec.lastSeenAt === "number" ? rec.lastSeenAt : 0,
+        lastRoomId: typeof rec.lastRoomId === "string" ? rec.lastRoomId : "",
+        lastRoomLabel: typeof rec.lastRoomLabel === "string" ? rec.lastRoomLabel : "",
+        recentRooms: Array.isArray(rec.recentRooms)
+          ? rec.recentRooms.filter((r): r is string => typeof r === "string").slice(0, 15)
+          : [],
+      };
+    }
+  }
+
+  if (obj.banned && typeof obj.banned === "object") {
+    for (const [k, v] of Object.entries(obj.banned as Record<string, unknown>)) {
+      if (!STUDENT_ID_RE.test(k) || !v || typeof v !== "object") continue;
+      const b = v as Partial<BanRecord>;
+      banned[k] = {
+        studentId: k,
+        reason: typeof b.reason === "string" ? b.reason : "",
+        bannedAt: typeof b.bannedAt === "number" ? b.bannedAt : 0,
+      };
+    }
+  }
+
+  return { users, banned };
+}
+
+export function checkBannedStudent(state: UsageState, studentId: string): BanRecord | null {
+  if (!studentId) return null;
+  return state.banned[studentId] || null;
+}
+
+export function buildBanErrorMessage(ban: BanRecord): string {
+  const reason = ban.reason.trim() || "异常高频查询";
+  return `当前学号因异常查询已被暂停宿舍电费查询权限（原因：${reason}），如有疑问请联系开发者`;
+}
+
+export function recordStudentQuery(
+  state: UsageState,
+  studentId: string,
+  roomMeta: RoomMeta,
+  isCacheMiss: boolean
+): boolean {
+  if (!studentId) return false;
+  const now = nowSeconds();
+  const meterSuffix = roomMeta.meterType ? ` (${roomMeta.meterType})` : "";
+  const roomLabel = `${roomMeta.campusName} · ${roomMeta.buildingName} ${roomMeta.roomName}${meterSuffix}`;
+  const existing = state.users[studentId];
+
+  if (!existing) {
+    state.users[studentId] = {
+      studentId,
+      totalQueries: 1,
+      cacheMissQueries: isCacheMiss ? 1 : 0,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      lastRoomId: roomMeta.roomid,
+      lastRoomLabel: roomLabel,
+      recentRooms: [roomMeta.roomid],
+    };
+    return true;
+  }
+
+  existing.totalQueries += 1;
+  if (isCacheMiss) {
+    existing.cacheMissQueries += 1;
+  }
+  existing.lastSeenAt = now;
+  existing.lastRoomId = roomMeta.roomid;
+  existing.lastRoomLabel = roomLabel;
+  existing.recentRooms = [
+    roomMeta.roomid,
+    ...existing.recentRooms.filter((r) => r !== roomMeta.roomid),
+  ].slice(0, 15);
+  return true;
+}
+
+export function summarizeUsageState(state: UsageState, searchQuery = "") {
+  const q = searchQuery.trim().toLowerCase();
+  const userList = Object.values(state.users)
+    .filter((u) => !q || u.studentId.toLowerCase().includes(q) || u.lastRoomLabel.toLowerCase().includes(q))
+    .map((u) => {
+      const ban = state.banned[u.studentId] || null;
+      return {
+        ...u,
+        distinctRoomCount: u.recentRooms.length,
+        isBanned: Boolean(ban),
+        banReason: ban?.reason || "",
+        bannedAt: ban?.bannedAt || 0,
+      };
+    })
+    .sort((a, b) =>
+      b.cacheMissQueries - a.cacheMissQueries ||
+      b.totalQueries - a.totalQueries ||
+      b.lastSeenAt - a.lastSeenAt
+    );
+
+  // Include banned students who might not yet have a usage record
+  for (const ban of Object.values(state.banned)) {
+    if (!state.users[ban.studentId]) {
+      if (!q || ban.studentId.toLowerCase().includes(q) || ban.reason.toLowerCase().includes(q)) {
+        userList.unshift({
+          studentId: ban.studentId,
+          totalQueries: 0,
+          cacheMissQueries: 0,
+          firstSeenAt: 0,
+          lastSeenAt: 0,
+          lastRoomId: "",
+          lastRoomLabel: "无查询记录（手动预拉黑）",
+          recentRooms: [],
+          distinctRoomCount: 0,
+          isBanned: true,
+          banReason: ban.reason,
+          bannedAt: ban.bannedAt,
+        });
+      }
+    }
+  }
+
+  const bannedList = Object.values(state.banned).sort((a, b) => b.bannedAt - a.bannedAt);
+
+  return {
+    totalUsers: Object.keys(state.users).length,
+    totalBanned: bannedList.length,
+    users: userList,
+    banned: bannedList,
+  };
 }
 
 export function normalizeSessionCredentials(

@@ -10,11 +10,13 @@ services:
     environment:
       PORT: "8080"
       SESSION_FILE: "/data/session_state.json"
+      USAGE_FILE: "/data/usage_state.json"
       ALLOWED_ADMIN_EMAIL: "${ALLOWED_ADMIN_EMAIL:-}"
       ALLOWED_ADMIN_HOST: "${ALLOWED_ADMIN_HOST:-}"
       CF_ACCESS_TEAM_DOMAIN: "${CF_ACCESS_TEAM_DOMAIN:-}"
       CF_ACCESS_AUD: "${CF_ACCESS_AUD:-}"
       REQUIRE_APP_SIGNATURE: "${REQUIRE_APP_SIGNATURE:-false}"
+      REQUIRE_STUDENT_ID: "${REQUIRE_STUDENT_ID:-false}"
       APP_SIGN_SECRET: "${APP_SIGN_SECRET:-}"
       CACHE_TTL_SECONDS: "${CACHE_TTL_SECONDS:-900}"
       CLIENT_MISS_LIMIT: "${CLIENT_MISS_LIMIT:-3}"

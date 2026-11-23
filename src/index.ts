@@ -1,19 +1,27 @@
 import { renderAdminHtml } from "./adminHtml";
 import {
   authenticateAdminRequest,
+  buildBanErrorMessage,
+  checkBannedStudent,
   corsHeaders,
+  createEmptyUsageState,
   createUpstreamGateway,
   ElectricityPayload,
   FACTORY_CODE,
   maskHex32,
   MissBucket,
   normalizeSessionCredentials,
+  normalizeUsageState,
   nowSeconds,
   parsePositiveInt,
+  recordStudentQuery,
   SessionState,
+  STUDENT_ID_RE,
+  summarizeUsageState,
   UpstreamAuthExpiredError,
   UpstreamBusyError,
   UpstreamQueryError,
+  UsageState,
   verifyClientSignatureHeaders,
 } from "./core";
 import { lookupRoom, ROOMS_JSON_STRING, TOTAL_ROOMS } from "./rooms";
@@ -24,6 +32,7 @@ export interface Env {
   CLIENT_MISS_LIMIT?: string;
   CLIENT_MISS_WINDOW_SECONDS?: string;
   REQUIRE_APP_SIGNATURE?: string;
+  REQUIRE_STUDENT_ID?: string;
   APP_SIGN_SECRET?: string;
   ALLOWED_ADMIN_EMAIL?: string;
   ALLOWED_ADMIN_HOST?: string;
@@ -33,6 +42,7 @@ export interface Env {
 }
 
 const KV_SESSION_KEY = "session_state";
+const KV_USAGE_KEY = "usage_state";
 
 const upstream = createUpstreamGateway();
 const isolateMissMap = new Map<string, MissBucket>();
@@ -65,6 +75,15 @@ async function readSessionState(env: Env): Promise<SessionState | null> {
 
 async function writeSessionState(env: Env, state: SessionState): Promise<void> {
   await env.ELE_KV.put(KV_SESSION_KEY, JSON.stringify(state));
+}
+
+async function readUsageState(env: Env): Promise<UsageState> {
+  const raw = await env.ELE_KV.get(KV_USAGE_KEY, "json");
+  return raw ? normalizeUsageState(raw) : createEmptyUsageState();
+}
+
+async function writeUsageState(env: Env, state: UsageState): Promise<void> {
+  await env.ELE_KV.put(KV_USAGE_KEY, JSON.stringify(state));
 }
 
 async function runHeartbeatCheck(
@@ -219,11 +238,18 @@ async function handlePublicElectricity(
     roomid,
     {
       requireSignature: env.REQUIRE_APP_SIGNATURE,
+      requireStudentId: env.REQUIRE_STUDENT_ID,
       appSignSecret: env.APP_SIGN_SECRET,
     }
   );
   if (!sigCheck.ok) {
     return jsonResponse({ error: sigCheck.error }, sigCheck.status);
+  }
+
+  const usageState = sigCheck.studentId ? await readUsageState(env) : createEmptyUsageState();
+  const ban = checkBannedStudent(usageState, sigCheck.studentId);
+  if (ban) {
+    return jsonResponse({ error: buildBanErrorMessage(ban), banned: true }, 403);
   }
 
   const cache = (caches as unknown as { default: Cache }).default;
@@ -234,6 +260,9 @@ async function handlePublicElectricity(
     const cachedResp = await cache.match(cacheReq);
     if (cachedResp) {
       const cachedData = (await cachedResp.json()) as ElectricityPayload;
+      if (recordStudentQuery(usageState, sigCheck.studentId, roomMeta, false)) {
+        ctx.waitUntil(writeUsageState(env, usageState));
+      }
       return jsonResponse({ ...cachedData, fromCache: true }, 200);
     }
   } catch {
@@ -247,9 +276,12 @@ async function handlePublicElectricity(
 
   const missLimit = parsePositiveInt(env.CLIENT_MISS_LIMIT, 3);
   const missWindow = parsePositiveInt(env.CLIENT_MISS_WINDOW_SECONDS, 600);
+  const quotaKey = sigCheck.studentId
+    ? `student:${sigCheck.studentId}`
+    : `client:${sigCheck.clientId}`;
   const quota = await checkAndConsumeMissQuota(
     url.origin,
-    sigCheck.clientId,
+    quotaKey,
     missLimit,
     missWindow,
     ctx
@@ -257,7 +289,7 @@ async function handlePublicElectricity(
   if (!quota.allowed) {
     return jsonResponse(
       {
-        error: `该设备未命中缓存的查询过于频繁（每 ${Math.ceil(missWindow / 60)} 分钟最多 ${missLimit} 次新房间查询），请稍后再试`,
+        error: `未命中缓存的新房间查询过于频繁（每 ${Math.ceil(missWindow / 60)} 分钟最多 ${missLimit} 次），请稍后再试`,
         retryAfterSeconds: quota.retryAfterSeconds,
       },
       429,
@@ -283,6 +315,9 @@ async function handlePublicElectricity(
       },
     });
     ctx.waitUntil(cache.put(cacheReq, cachePutResp));
+    if (recordStudentQuery(usageState, sigCheck.studentId, roomMeta, true)) {
+      ctx.waitUntil(writeUsageState(env, usageState));
+    }
     return jsonResponse(payload, 200);
   } catch (err) {
     if (err instanceof UpstreamBusyError || err instanceof UpstreamAuthExpiredError) {
@@ -482,6 +517,51 @@ export default {
 
       if (request.method === "GET" && path === "/admin/api/test-query") {
         return handleAdminTestQuery(url, env);
+      }
+
+      if (request.method === "GET" && path === "/admin/api/users") {
+        const usage = await readUsageState(env);
+        const q = url.searchParams.get("q") || "";
+        return jsonResponse(summarizeUsageState(usage, q));
+      }
+
+      if (request.method === "POST" && path === "/admin/api/ban") {
+        let body: { studentId?: string; reason?: string };
+        try {
+          body = (await request.json()) as { studentId?: string; reason?: string };
+        } catch {
+          return jsonResponse({ error: "请求体必须为合法 JSON" }, 400);
+        }
+        const sid = (body.studentId || "").trim();
+        const reason = (body.reason || "").trim().slice(0, 120);
+        if (!STUDENT_ID_RE.test(sid)) {
+          return jsonResponse({ error: "学号格式无效（仅允许 6~20 位字母或数字）" }, 400);
+        }
+        const usage = await readUsageState(env);
+        usage.banned[sid] = {
+          studentId: sid,
+          reason: reason || "异常高频查询",
+          bannedAt: nowSeconds(),
+        };
+        await writeUsageState(env, usage);
+        return jsonResponse({ success: true, message: `已拉黑学号 ${sid}`, studentId: sid });
+      }
+
+      if (request.method === "POST" && path === "/admin/api/unban") {
+        let body: { studentId?: string };
+        try {
+          body = (await request.json()) as { studentId?: string };
+        } catch {
+          return jsonResponse({ error: "请求体必须为合法 JSON" }, 400);
+        }
+        const sid = (body.studentId || "").trim();
+        if (!STUDENT_ID_RE.test(sid)) {
+          return jsonResponse({ error: "学号格式无效" }, 400);
+        }
+        const usage = await readUsageState(env);
+        delete usage.banned[sid];
+        await writeUsageState(env, usage);
+        return jsonResponse({ success: true, message: `已解除拉黑 ${sid}`, studentId: sid });
       }
 
       return jsonResponse({ error: "Not Found" }, 404);
